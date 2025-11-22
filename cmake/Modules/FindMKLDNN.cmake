@@ -19,11 +19,10 @@ IF(NOT MKLDNN_FOUND)
   SET(IDEEP_ROOT "${PROJECT_SOURCE_DIR}/third_party/ideep")
   SET(MKLDNN_ROOT "${PROJECT_SOURCE_DIR}/third_party/ideep/mkl-dnn")
 
-  if(USE_CCACHE)
-    find_program(CCACHE_PROGRAM ccache)
-    if(CCACHE_PROGRAM)
-      message("MKLDNN find CCACHE_PROGRAM: ${CCACHE_PROGRAM}")
-    endif()
+if(USE_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    message("MKLDNN find CCACHE_PROGRAM: ${CCACHE_PROGRAM}")
   endif()
 
   if(USE_XPU) # Build oneDNN GPU library
