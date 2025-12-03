@@ -29,10 +29,7 @@ IF(NOT MKLDNN_FOUND)
       string(STRIP "${SYCL_COMPILER_LAUNCHER}" CLEANED_SYCL_COMPILER_LAUNCHER)
       string(REPLACE "\\" "/" CLEANED_SYCL_COMPILER_LAUNCHER "${CLEANED_SYCL_COMPILER_LAUNCHER}")
     else()
-      message(
-        STATUS
-          "Could not find ccache."
-      )
+      message("MKLDNN could not find ccache.")
     endif()
     if(WIN32)
       # Windows
