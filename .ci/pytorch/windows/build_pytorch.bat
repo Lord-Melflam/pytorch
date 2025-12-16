@@ -70,10 +70,8 @@ if not "%CUDA_VERSION%" == "cpu" if not "%CUDA_VERSION%" == "xpu" (
 :: Install sccache
 if "%USE_SCCACHE%" == "1" (
     mkdir %CD%\tmp_bin
-    if not "%CUDA_VERSION%" == "xpu"(
-        curl -k https://s3.amazonaws.com/ossci-windows/sccache.exe --output %CD%\tmp_bin\sccache.exe
-        curl -k https://s3.amazonaws.com/ossci-windows/sccache-cl.exe --output %CD%\tmp_bin\sccache-cl.exe
-    }
+    curl -k https://s3.amazonaws.com/ossci-windows/sccache.exe --output %CD%\tmp_bin\sccache.exe
+    curl -k https://s3.amazonaws.com/ossci-windows/sccache-cl.exe --output %CD%\tmp_bin\sccache-cl.exe
     if not "%CUDA_VERSION%" == "" (
         set ADDITIONAL_PATH=%CD%\tmp_bin
         set SCCACHE_IDLE_TIMEOUT=1500
