@@ -37,6 +37,9 @@ from torch.fx.experimental.proxy_tensor import (
 from torch.fx.graph_module import GraphModule
 from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
+from torch._logging import getArtifactLogger
+
+annotation_log = getArtifactLogger(__name__, "annotation")
 
 
 invoke_subgraph_counter = 0
@@ -140,9 +143,11 @@ class InvokeSubgraphHOP(HigherOrderOperator):
         )
 
         subgraph_decomp_table = _extract_nested_region_config(subgraph)
-        gm: torch.fx.GraphModule = materialize_as_graph(
-            subgraph, operands, subgraph_decomp_table=subgraph_decomp_table
-        )
+        # See NB: annotation in invoke_subgraph
+        with torch.fx.traceback.set_current_annotation({}):
+            gm: torch.fx.GraphModule = materialize_as_graph(
+                subgraph, operands, subgraph_decomp_table=subgraph_decomp_table
+            )
 
         schema_gen = HopSchemaGenerator(self)
         schema_gen.add_arg("subgraph", gm)
@@ -640,6 +645,12 @@ class InvokeSubgraphAutogradOp(torch.autograd.Function):
                         "nested_region_config"
                     ]
 
+                # NB: invoke_subgraph seq_nr
+                # The joint graph seq_nr will get wrong in the subsequent re-trace, so we
+                # need to copy the metadata here. We exclude invoke_subgraph's subgrpahs
+                # from subsequence copy.
+                torch._functorch._aot_autograd.utils.copy_fwd_metadata_to_bw_nodes(bw_graph)
+
         if invoke_subgraph_cache and not cache_hit:
             suffix = invoke_subgraph_cache.add_lazy_bwd_entry(
                 identifier, tangent_metadata, bw_graph
@@ -793,9 +804,11 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
 
         with dynamo_timed("invoke_subgraph_proxy_tensor", log_pt2_compile_event=True):
             subgraph_decomp_table = _extract_nested_region_config(subgraph)
-            graph = reenter_make_fx(
-                subgraph, subgraph_decomp_table=subgraph_decomp_table
-            )(*operands)
+            # See NB: annotation in invoke_subgraph
+            with torch.fx.traceback.set_current_annotation({}):
+                graph = reenter_make_fx(
+                    subgraph, subgraph_decomp_table=subgraph_decomp_table
+                )(*operands)
 
         from torch._guards import detect_fake_mode
 
@@ -848,6 +861,12 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
     out_proxy = proxy_mode.tracer.create_proxy(
         "call_function", invoke_subgraph, proxy_args, {}
     )
+    seq_nr = next(iter(graph.graph.nodes)).meta["seq_nr"]
+    out_proxy.node.meta["seq_nr"] = seq_nr
+    annotation_log.debug("Overriding invoke_subraph node seq_nr %s to %s", seq_nr, out_proxy.node.name)
+    out_proxy.node.args[0].meta["seq_nr"] = seq_nr
+    annotation_log.debug("Overriding invoke_subraph node seq_nr %s to %s", seq_nr, out_proxy.node.args[0].name)
+
 
     example_out = invoke_subgraph(graph, identifier, *operands)
     return track_tensor_tree(
