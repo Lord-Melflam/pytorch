@@ -1576,9 +1576,18 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
         self.annotations = annotations
         self.closure = closure
         self.wrapped_fn: VariableTracker | None = wrapped_fn
+        # Used to detect cycles in mutually recursive closures
+        self._converting = False
 
     def self_args(self) -> list[VariableTracker]:
         return []
+
+    def clone(self, **kwargs: Any) -> VariableTracker:
+        # _converting shouldn't be included
+        args = dict(self.__dict__)
+        args.pop("_converting", None)
+        args.update(kwargs)
+        return self.__class__(**args)
 
     def as_python_constant(self):
         return self.get_function()
@@ -1590,12 +1599,56 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
         return types.FunctionType
 
     def get_function(self) -> types.FunctionType:
+        from .base import AsPythonConstantNotImplementedError, ClosureConversionError
+
+        if self._converting:
+            raise ClosureConversionError(
+                "cycle detected in mutually recursive closures"
+            )
+        self._converting = True
+        try:
+            return self._get_function_impl()
+        except AsPythonConstantNotImplementedError as e:
+            raise ClosureConversionError(str(e)) from e
+        finally:
+            self._converting = False
+
+    def _get_function_impl(self) -> types.FunctionType:
+        closure_cells = None
         if self.closure:
-            raise NotImplementedError("get_function")
+            from torch._dynamo.symbolic_convert import InstructionTranslator
+
+            tx = InstructionTranslator.current_tx()
+            cells = []
+
+            for cell_var in self.closure.items:  # type: ignore[attr-defined]
+                # Get the cell contents from side_effects or pre_existing_contents
+                # load_cell will replay the side-effects
+                cell_contents = tx.output.side_effects.load_cell(cell_var)
+
+                # Check for self-referential closure (function capturing itself for recursion)
+                # For example:
+                # def outer():
+                #     def helper(n):
+                #         if n <= 0:
+                #             return 0
+                #         return n + helper(n - 1)  # helper calls itself
+                #     return helper
+                if cell_contents is self:
+                    from .base import ClosureConversionError
+
+                    raise ClosureConversionError("self-referential nested function")
+
+                value = cell_contents.as_python_constant()
+                cells.append(make_cell(value))
+            closure_cells = tuple(cells)
+
         func = types.FunctionType(
             self.code.as_python_constant(),
             self.f_globals,
             self.fn_name.as_python_constant(),
+            argdefs=None,  # defaults - will set below if needed
+            closure=closure_cells,
         )
         if self.defaults:
             func.__defaults__ = self.defaults.as_python_constant()
