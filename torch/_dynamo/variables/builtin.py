@@ -41,6 +41,7 @@ from torch.overrides import BaseTorchFunctionMode
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from .. import config, graph_break_hints, polyfills, variables
+from ..bytecode_transformation import create_instruction
 from ..exc import (
     AttributeMutationError,
     ObservedAttributeError,
@@ -206,6 +207,82 @@ un_ops = (
     operator.not_,  # Note: this has a local scalar dense call
     operator.length_hint,
 )
+
+
+# Map operator functions to BINARY_OP arg values (Python 3.11+)
+# or to pre-3.11 opnames. Used by _make_binary_op_reconstruct_fn.
+if sys.version_info >= (3, 11):
+    import dis
+
+    # pyrefly: ignore[missing-attribute]
+    _NB_OP_TO_ARG = {name: idx for idx, (name, _) in enumerate(dis._nb_ops)}
+    _OPERATOR_TO_BINARY_OP_ARG: dict[Callable[..., Any], int] = {
+        operator.add: _NB_OP_TO_ARG["NB_ADD"],
+        operator.and_: _NB_OP_TO_ARG["NB_AND"],
+        operator.floordiv: _NB_OP_TO_ARG["NB_FLOOR_DIVIDE"],
+        operator.lshift: _NB_OP_TO_ARG["NB_LSHIFT"],
+        operator.matmul: _NB_OP_TO_ARG["NB_MATRIX_MULTIPLY"],
+        operator.mul: _NB_OP_TO_ARG["NB_MULTIPLY"],
+        operator.mod: _NB_OP_TO_ARG["NB_REMAINDER"],
+        operator.or_: _NB_OP_TO_ARG["NB_OR"],
+        operator.pow: _NB_OP_TO_ARG["NB_POWER"],
+        operator.rshift: _NB_OP_TO_ARG["NB_RSHIFT"],
+        operator.sub: _NB_OP_TO_ARG["NB_SUBTRACT"],
+        operator.truediv: _NB_OP_TO_ARG["NB_TRUE_DIVIDE"],
+        operator.xor: _NB_OP_TO_ARG["NB_XOR"],
+    }
+    _OPERATOR_TO_BINARY_OPNAME: dict[Callable[..., Any], str] = {}
+else:
+    _OPERATOR_TO_BINARY_OP_ARG: dict[Callable[..., Any], int] = {}
+    _OPERATOR_TO_BINARY_OPNAME: dict[Callable[..., Any], str] = {
+        operator.add: "BINARY_ADD",
+        operator.and_: "BINARY_AND",
+        operator.floordiv: "BINARY_FLOOR_DIVIDE",
+        operator.lshift: "BINARY_LSHIFT",
+        operator.matmul: "BINARY_MATRIX_MULTIPLY",
+        operator.mul: "BINARY_MULTIPLY",
+        operator.mod: "BINARY_MODULO",
+        operator.or_: "BINARY_OR",
+        operator.pow: "BINARY_POWER",
+        operator.rshift: "BINARY_RSHIFT",
+        operator.sub: "BINARY_SUBTRACT",
+        operator.truediv: "BINARY_TRUE_DIVIDE",
+        operator.xor: "BINARY_XOR",
+    }
+
+
+def _make_binary_op_reconstruct_fn(
+    op: Callable[..., Any],
+) -> Callable[[Any, list[VariableTracker]], None] | None:
+    """Create a reconstruct_fn for a binary operation.
+
+    Returns a function that generates bytecode to recompute the result
+    by loading the operands and applying the binary operation.
+    Returns None if the operation is not a supported binary operation.
+    """
+    if sys.version_info >= (3, 11):
+        if op not in _OPERATOR_TO_BINARY_OP_ARG:
+            return None
+        binary_op_arg = _OPERATOR_TO_BINARY_OP_ARG[op]
+
+        def reconstruct_fn(codegen: Any, args: list[VariableTracker]) -> None:
+            codegen(args[0])
+            codegen(args[1])
+            codegen.append_output(create_instruction("BINARY_OP", arg=binary_op_arg))
+
+        return reconstruct_fn
+    else:
+        if op not in _OPERATOR_TO_BINARY_OPNAME:
+            return None
+        binary_opname = _OPERATOR_TO_BINARY_OPNAME[op]
+
+        def reconstruct_fn(codegen: Any, args: list[VariableTracker]) -> None:
+            codegen(args[0])
+            codegen(args[1])
+            codegen.append_output(create_instruction(binary_opname))
+
+        return reconstruct_fn
+
 
 BUILTIN_TO_TENSOR_FN_MAP: dict[Callable[..., Any], Callable[..., Any]] = {}
 
@@ -1007,34 +1084,104 @@ class BuiltinVariable(VariableTracker):
         ],
         VariableTracker | None,
     ]:
-        from .lazy import LazyConstantVariable, LazyVariableTracker
+        from .lazy import (
+            ComputedLazyConstantVariable,
+            LazyConstantVariable,
+            LazyVariableTracker,
+        )
 
         obj = BuiltinVariable(fn)
         handlers: list[_HandlerCallback] = []
 
-        # Check for non-LazyConstantVariable lazy types that need realization.
-        # LazyConstantVariable is mapped to ConstantVariable in call_function's
-        # get_handler_type_for_dispatch, so it won't appear in arg_types here.
-        # But regular LazyVariableTracker still needs to be realized before handling.
-        if any(
-            issubclass(t, LazyVariableTracker)
-            and not issubclass(t, LazyConstantVariable)
-            for t in arg_types
-        ):
-            # Realize lazy args except LazyConstantVariable.
-            # Only realize top-level args, not nested VariableTracker fields.
-            def realize_arg(arg: VariableTracker) -> VariableTracker:
-                if isinstance(arg, LazyVariableTracker) and not isinstance(
-                    arg, LazyConstantVariable
-                ):
-                    return arg.realize()
-                return arg
-
-            return lambda tx, args, kwargs: obj.call_function(
-                tx,
-                [realize_arg(a) for a in args],
-                kwargs,
+        if any(issubclass(t, LazyVariableTracker) for t in arg_types):
+            # Check if we can handle this lazily (all args are lazy/computed lazy constants
+            # or regular constants, and the op can be constant-folded)
+            all_constant_like = all(
+                issubclass(
+                    t,
+                    (
+                        LazyConstantVariable,
+                        ComputedLazyConstantVariable,
+                        ConstantVariable,
+                    ),
+                )
+                for t in arg_types
             )
+            # Comparison operators should NOT be lazy - they typically affect control flow
+            # and need to trigger realization to install guards
+            is_comparison_op = fn in supported_comparison_ops.values()
+            if (
+                all_constant_like
+                and obj.can_constant_fold_through()
+                and not has_kwargs
+                and not is_comparison_op
+            ):
+                # Return a ComputedLazyConstantVariable instead of realizing.
+                # This allows operations on lazy constants to remain lazy, deferring
+                # guard installation until the result is actually used.
+                #
+                # If the result is used in a tensor operation and automatic_dynamic_shapes
+                # kicks in (making source vars symbolic), ComputedLazyCache.realize()
+                # will detect this and re-apply the operation symbolically.
+                def handle_lazy_constant(tx, args, kwargs):
+                    from .. import config
+
+                    # Check if we have a reconstruct_fn for this operation.
+                    # Only use ComputedLazyConstantVariable if we can reconstruct
+                    # the result at runtime (via bytecode generation).
+                    reconstruct_fn = _make_binary_op_reconstruct_fn(fn)
+                    if reconstruct_fn is None:
+                        # No reconstruct_fn (e.g., str.format) - fall back to
+                        # realizing lazy args so guards are properly installed.
+                        return obj.call_function(
+                            tx,
+                            [v.realize() for v in args],
+                            kwargs,
+                        )
+
+                    # Check if any lazy constant might become symbolic due to
+                    # specialize_int=False or specialize_float=False. If so, we must
+                    # realize to allow symbolic tracing.
+                    #
+                    # This is important because if we don't realize, the function may
+                    # skip compilation entirely (no tensor ops in graph), but we need
+                    # the symbolic tracing to happen for unbacked int/float support.
+                    for arg in args:
+                        if (
+                            isinstance(arg, LazyConstantVariable)
+                            and not arg.is_realized()
+                        ):
+                            val_type = arg.peek_type()
+                            if val_type is int and not config.specialize_int:
+                                # Int might become SymNodeVariable - must realize
+                                return obj.call_function(
+                                    tx,
+                                    [v.realize() for v in args],
+                                    kwargs,
+                                )
+                            if val_type is float and not config.specialize_float:
+                                # Float might become SymNodeVariable - must realize
+                                return obj.call_function(
+                                    tx,
+                                    [v.realize() for v in args],
+                                    kwargs,
+                                )
+
+                    return ComputedLazyConstantVariable.create(
+                        fn, list(args), reconstruct_fn
+                    )
+
+                return handle_lazy_constant
+            else:
+                # Fall back to realizing lazy args.
+                # We must realize all LazyVariableTracker (including LazyConstantVariable)
+                # to avoid infinite recursion in handler dispatch - calling obj.call_function()
+                # with unrealized lazy constants would dispatch back to this same handler.
+                return lambda tx, args, kwargs: obj.call_function(
+                    tx,
+                    [v.realize() for v in args],
+                    kwargs,
+                )
 
         if inspect.isclass(fn) and (
             issubclass(fn, Exception)
@@ -1181,7 +1328,52 @@ class BuiltinVariable(VariableTracker):
                     args: Sequence[VariableTracker],
                     kwargs: dict[str, VariableTracker],
                 ) -> VariableTracker | None:
-                    # path with a runtime check
+                    # First try to peek at all args as constants without realizing
+                    # This allows us to constant-fold through lazy constants
+                    peeked_args = []
+                    any_unrealized = False
+                    all_can_peek = True
+
+                    for arg in args:
+                        can_peek, is_unrealized, value = arg.try_peek_constant()
+                        if not can_peek:
+                            all_can_peek = False
+                            break
+                        peeked_args.append(value)
+                        if is_unrealized:
+                            any_unrealized = True
+
+                    peeked_kwargs = {}
+                    if all_can_peek:
+                        for k, v in kwargs.items():
+                            can_peek, is_unrealized, value = v.try_peek_constant()
+                            if not can_peek:
+                                all_can_peek = False
+                                break
+                            peeked_kwargs[k] = value
+                            if is_unrealized:
+                                any_unrealized = True
+
+                    if all_can_peek:
+                        try:
+                            res = fn(*peeked_args, **peeked_kwargs)
+                        except Exception as exc:
+                            raise_observed_exception(
+                                type(exc),
+                                tx,
+                                args=list(map(ConstantVariable.create, exc.args)),
+                            )
+
+                        if any_unrealized:
+                            # Realize all lazy constants to install guards
+                            from .lazy import LazyVariableTracker
+
+                            LazyVariableTracker.realize_all((args, kwargs))
+
+                        # pyrefly: ignore [unbound-name]
+                        return VariableTracker.build(tx, res)
+
+                    # Fall back to the original check for UnspecializedPythonVariable
                     if check_unspec_or_constant_args(args, kwargs):
                         try:
                             res = fn(
